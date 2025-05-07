@@ -1,12 +1,7 @@
 #include "common.h"
 
 void init_openssl() {
-    
-    
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    ERR_load_BIO_strings();
-    ERR_load_crypto_strings();
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS | OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS, NULL);
 }
 
 void cleanup_openssl() {
