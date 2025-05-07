@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <map>
+
 
 
 void init_openssl();
