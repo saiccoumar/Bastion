@@ -202,7 +202,7 @@ int main(int argc, char* argv[]) {
         
         char buf[256];
         while (true) {
-            ssize_t n = read(STDIN_FILeno, buf, sizeof(buf));
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
             if (n <= 0) break; 
 
             std::vector<unsigned char> plaintext(buf, buf + n);
