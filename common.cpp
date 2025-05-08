@@ -364,17 +364,18 @@ bool send_message(int sock, const std::vector<unsigned char>& data) {
 
 std::vector<unsigned char> receive_message(int sock) {
     uint32_t network_len;
-    if (receive_all(sock, sizeof(network_len)).empty()) return {}; 
+    auto len_buffer = receive_all(sock, sizeof(network_len));
+    if (len_buffer.empty()) return {}; 
 
-    network_len = *(uint32_t*)receive_all(sock, sizeof(network_len)).data(); 
-     if (receive_all(sock, sizeof(network_len)).empty()) return {}; 
+    memcpy(&network_len, len_buffer.data(), sizeof(network_len));
     uint32_t len = ntohl(network_len);
 
-    if (len == 0) return {}; 
+    if (len == 0) {
+        return {}; 
+    }
 
     return receive_all(sock, len);
 }
-
 
 
 bool send_encrypted_message(int sock, const std::vector<unsigned char>& plaintext,
@@ -419,45 +420,41 @@ bool send_encrypted_message(int sock, const std::vector<unsigned char>& plaintex
 std::vector<unsigned char> receive_encrypted_message(int sock, const unsigned char* key) {
     std::vector<unsigned char> plaintext;
 
-    
+    // Read IV length
     uint32_t network_iv_len;
-    if (receive_all(sock, sizeof(network_iv_len)).empty()) return {};
-    uint32_t iv_len = ntohl(*(uint32_t*)receive_all(sock, sizeof(network_iv_len)).data()); 
-
-     if (receive_all(sock, sizeof(network_iv_len)).empty()) return {};
-     iv_len = ntohl(*(uint32_t*)receive_all(sock, sizeof(network_iv_len)).data());
-
+    auto iv_len_buffer = receive_all(sock, sizeof(network_iv_len));
+    if (iv_len_buffer.empty()) return {};
+    memcpy(&network_iv_len, iv_len_buffer.data(), sizeof(network_iv_len));
+    uint32_t iv_len = ntohl(network_iv_len);
 
     if (iv_len != AES_GCM_IV_SIZE) {
         std::cerr << "[Error] Received unexpected IV length: " << iv_len << std::endl;
         return {};
     }
 
-    
+    // Read IV
     std::vector<unsigned char> iv = receive_all(sock, iv_len);
     if (iv.empty()) return {};
 
-    
+    // Read ciphertext length
     uint32_t network_ciphertext_len;
-    if (receive_all(sock, sizeof(network_ciphertext_len)).empty()) return {};
-    uint32_t ciphertext_len = ntohl(*(uint32_t*)receive_all(sock, sizeof(network_ciphertext_len)).data()); 
+    auto ciphertext_len_buffer = receive_all(sock, sizeof(network_ciphertext_len));
+    if (ciphertext_len_buffer.empty()) return {};
+    memcpy(&network_ciphertext_len, ciphertext_len_buffer.data(), sizeof(network_ciphertext_len));
+    uint32_t ciphertext_len = ntohl(network_ciphertext_len);
 
-     if (receive_all(sock, sizeof(network_ciphertext_len)).empty()) return {};
-     ciphertext_len = ntohl(*(uint32_t*)receive_all(sock, sizeof(network_ciphertext_len)).data());
-
-
-    
+    // Read ciphertext
     std::vector<unsigned char> ciphertext = receive_all(sock, ciphertext_len);
     if (ciphertext.empty()) return {};
 
-    
+    // Read tag
     std::vector<unsigned char> tag = receive_all(sock, AES_GCM_TAG_SIZE);
     if (tag.empty()) return {};
 
-    
+    // Perform decryption
     if (!perform_decryption(ciphertext, tag, key, iv.data(), plaintext)) {
         std::cerr << "[Error] Decryption or tag verification failed." << std::endl;
-        return {}; 
+        return {};
     }
 
     return plaintext;

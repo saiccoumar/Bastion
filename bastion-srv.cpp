@@ -137,31 +137,105 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
     }
 
     if (pid == 0) {
-        
+        // Child process
+        int pipe_in[2], pipe_out[2];
+        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+            perror("[Server Error] pipe creation failed");
+            close(client_sock);
+            exit(EXIT_FAILURE);
+        }
 
-        
-        dup2(client_sock, STDIN_FILENO);
-        dup2(client_sock, STDOUT_FILENO);
-        dup2(client_sock, STDERR_FILENO);
+        pid_t ssh_pid = fork();
+        if (ssh_pid < 0) {
+            perror("[Server Error] Fork for SSH process failed");
+            close(client_sock);
+            exit(EXIT_FAILURE);
+        }
 
-        
-        close(client_sock);
+        if (ssh_pid == 0) {
+            // Grandchild process (SSH)
+            close(pipe_in[1]);  // Close write end of input pipe
+            close(pipe_out[0]); // Close read end of output pipe
 
-        
-        execlp("ssh", "ssh", "-tt", target.c_str(), nullptr);
+            // Redirect pipes to stdin and stdout
+            if (dup2(pipe_in[0], STDIN_FILENO) < 0 ||
+                dup2(pipe_out[1], STDOUT_FILENO) < 0) {
+                perror("[Server Error] dup2 failed for SSH process");
+                exit(EXIT_FAILURE);
+            }
 
-        
-        perror("execlp ssh failed");
-        exit(EXIT_FAILURE); 
-    } else {
-        
-        
-        close(client_sock);
+            // Close unused pipe ends
+            close(pipe_in[0]);
+            close(pipe_out[1]);
 
-        
-        int status;
-        waitpid(pid, &status, 0);
-        std::cout << "[Server] SSH process for target '" << target << "' finished with status " << status << "." << std::endl;
+            // Execute the SSH command
+            execlp("ssh", "ssh", "-tt", target.c_str(), nullptr);
+
+            // If execlp fails, log the error and exit
+            perror("[Server Error] execlp ssh failed");
+            exit(EXIT_FAILURE);
+        } else {
+            // Child process (Server-side proxy)
+            close(pipe_in[0]);  // Close read end of input pipe
+            close(pipe_out[1]); // Close write end of output pipe
+
+            // Use `select` for bidirectional communication
+            fd_set read_fds;
+            int max_fd = std::max(client_sock, pipe_out[0]);
+
+            char buffer[4096];
+            ssize_t bytes_read;
+
+            while (true) {
+                FD_ZERO(&read_fds);
+                FD_SET(client_sock, &read_fds);  // Monitor client socket
+                FD_SET(pipe_out[0], &read_fds); // Monitor SSH output pipe
+
+                // Wait for data on either the client socket or the SSH output pipe
+                if (select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
+                    perror("[Server Error] select failed");
+                    break;
+                }
+
+                // Data from the SSH process to the client
+                if (FD_ISSET(pipe_out[0], &read_fds)) {
+                    bytes_read = read(pipe_out[0], buffer, sizeof(buffer));
+                    if (bytes_read <= 0) break; // EOF or error
+
+                    std::vector<unsigned char> plaintext(buffer, buffer + bytes_read);
+                    if (!send_encrypted_message(client_sock, plaintext, session_key)) {
+                        std::cerr << "[Server] Failed to send encrypted data to client." << std::endl;
+                        break;
+                    }
+                }
+
+                // Data from the client to the SSH process
+                if (FD_ISSET(client_sock, &read_fds)) {
+                    std::vector<unsigned char> encrypted_data = receive_encrypted_message(client_sock, session_key);
+                    if (encrypted_data.empty()) {
+                        std::cerr << "[Server] Failed to receive encrypted data from client." << std::endl;
+                        break;
+                    }
+
+                    // Write decrypted data to the SSH process
+                    if (write(pipe_in[1], encrypted_data.data(), encrypted_data.size()) < 0) {
+                        perror("[Server Error] Failed to write to SSH process");
+                        break;
+                    }
+                }
+            }
+
+            // Close pipes and socket
+            close(pipe_in[1]);
+            close(pipe_out[0]);
+            close(client_sock);
+
+            // Wait for the SSH process to finish
+            int status;
+            waitpid(ssh_pid, &status, 0);
+            std::cout << "[Server] SSH process finished with status " << status << "." << std::endl;
+            exit(EXIT_SUCCESS);
+        }
     }
 }
 
