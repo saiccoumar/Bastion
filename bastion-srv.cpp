@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <vector>
+#include <pty.h> // Include for forkpty
 
 #include "common.h" 
 
@@ -145,28 +146,18 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
             exit(EXIT_FAILURE);
         }
 
-        pid_t ssh_pid = fork();
+        int master_fd; // File descriptor for the master side of the pseudo-terminal
+        pid_t ssh_pid = forkpty(&master_fd, nullptr, nullptr, nullptr);
         if (ssh_pid < 0) {
-            perror("[Server Error] Fork for SSH process failed");
+            perror("[Server Error] forkpty failed for SSH process");
             close(client_sock);
             exit(EXIT_FAILURE);
         }
 
         if (ssh_pid == 0) {
             // Grandchild process (SSH)
-            close(pipe_in[1]);  // Close write end of input pipe
-            close(pipe_out[0]); // Close read end of output pipe
-
-            // Redirect pipes to stdin and stdout
-            if (dup2(pipe_in[0], STDIN_FILENO) < 0 ||
-                dup2(pipe_out[1], STDOUT_FILENO) < 0) {
-                perror("[Server Error] dup2 failed for SSH process");
-                exit(EXIT_FAILURE);
-            }
-
-            // Close unused pipe ends
-            close(pipe_in[0]);
-            close(pipe_out[1]);
+            unsetenv("DISPLAY");
+            unsetenv("SSH_ASKPASS");
 
             // Execute the SSH command
             execlp("ssh", "ssh", "-tt", target.c_str(), nullptr);
@@ -181,7 +172,7 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
 
             // Use `select` for bidirectional communication
             fd_set read_fds;
-            int max_fd = std::max(client_sock, pipe_out[0]);
+            int max_fd = std::max(client_sock, master_fd);
 
             char buffer[4096];
             ssize_t bytes_read;
@@ -189,17 +180,16 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
             while (true) {
                 FD_ZERO(&read_fds);
                 FD_SET(client_sock, &read_fds);  // Monitor client socket
-                FD_SET(pipe_out[0], &read_fds); // Monitor SSH output pipe
+                FD_SET(master_fd, &read_fds);   // Monitor SSH PTY
 
-                // Wait for data on either the client socket or the SSH output pipe
                 if (select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
                     perror("[Server Error] select failed");
                     break;
                 }
 
                 // Data from the SSH process to the client
-                if (FD_ISSET(pipe_out[0], &read_fds)) {
-                    bytes_read = read(pipe_out[0], buffer, sizeof(buffer));
+                if (FD_ISSET(master_fd, &read_fds)) {
+                    bytes_read = read(master_fd, buffer, sizeof(buffer));
                     if (bytes_read <= 0) break; // EOF or error
 
                     std::vector<unsigned char> plaintext(buffer, buffer + bytes_read);
@@ -218,7 +208,7 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
                     }
 
                     // Write decrypted data to the SSH process
-                    if (write(pipe_in[1], encrypted_data.data(), encrypted_data.size()) < 0) {
+                    if (write(master_fd, encrypted_data.data(), encrypted_data.size()) < 0) {
                         perror("[Server Error] Failed to write to SSH process");
                         break;
                     }
@@ -227,7 +217,7 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
 
             // Close pipes and socket
             close(pipe_in[1]);
-            close(pipe_out[0]);
+            close(master_fd);
             close(client_sock);
 
             // Wait for the SSH process to finish
