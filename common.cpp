@@ -288,6 +288,91 @@ bool perform_decryption(const std::vector<unsigned char>& ciphertext,
     }
 }
 
+
+unsigned char* perform_server_handshake(int client_sock, const sockaddr_in* client_addr, 
+                            EVP_PKEY* server_static_key, EVP_PKEY*& client_ephemeral_pubkey) {
+    print_openssl_errors("Start server handshake");
+
+    EVP_PKEY* server_ephemeral_key = generate_ecdh_key();
+    if (!server_ephemeral_key) {
+        std::cerr << "[Server] Failed to generate ephemeral key." << std::endl;
+        return nullptr;
+    }
+
+    // Now using server_static_key parameter instead of global variable
+    std::vector<unsigned char> static_pub_der = get_public_key_der(server_static_key);
+    std::vector<unsigned char> ephemeral_pub_der = get_public_key_der(server_ephemeral_key);
+
+    if (static_pub_der.empty() || ephemeral_pub_der.empty()) {
+        EVP_PKEY_free(server_ephemeral_key);
+        return nullptr;
+    }
+
+    
+    if (!send_message(client_sock, static_pub_der)) {
+        std::cerr << "[Server] Failed to send static public key." << std::endl;
+        EVP_PKEY_free(server_ephemeral_key);
+        return nullptr;
+    }
+
+    
+    if (!send_message(client_sock, ephemeral_pub_der)) {
+        std::cerr << "[Server] Failed to send ephemeral public key." << std::endl;
+        EVP_PKEY_free(server_ephemeral_key);
+        return nullptr;
+    }
+     std::cout << "[Server] Sent static and ephemeral public keys." << std::endl;
+
+
+    
+    std::vector<unsigned char> client_ephemeral_pub_der = receive_message(client_sock);
+    if (client_ephemeral_pub_der.empty()) {
+        std::cerr << "[Server] Failed to receive client ephemeral public key." << std::endl;
+        EVP_PKEY_free(server_ephemeral_key);
+        return nullptr;
+    }
+    std::cout << "[Server] Received client ephemeral public key." << std::endl;
+
+
+    
+    client_ephemeral_pubkey = create_pkey_from_public_der(client_ephemeral_pub_der);
+    if (!client_ephemeral_pubkey) {
+        std::cerr << "[Server] Failed to create EVP_PKEY from client public key DER." << std::endl;
+        EVP_PKEY_free(server_ephemeral_key);
+        return nullptr;
+    }
+
+    
+    std::vector<unsigned char> shared_secret = derive_shared_secret(server_ephemeral_key, client_ephemeral_pubkey);
+    EVP_PKEY_free(server_ephemeral_key); 
+
+    if (shared_secret.empty()) {
+        std::cerr << "[Server] Failed to derive shared secret." << std::endl;
+        EVP_PKEY_free(client_ephemeral_pubkey); 
+        client_ephemeral_pubkey = NULL;
+        return nullptr;
+    }
+     std::cout << "[Server] Derived shared secret (size: " << shared_secret.size() << ")." << std::endl;
+
+
+    
+    
+    std::vector<unsigned char> hashed_secret = calculate_sha256(shared_secret);
+    if (hashed_secret.size() < AES_KEY_SIZE) {
+        std::cerr << "[Server] Hashed shared secret is too short for AES key." << std::endl;
+        EVP_PKEY_free(client_ephemeral_pubkey);
+        client_ephemeral_pubkey = NULL;
+        return nullptr;
+    }
+
+    unsigned char* session_key = new unsigned char[AES_KEY_SIZE];
+    memcpy(session_key, hashed_secret.data(), AES_KEY_SIZE);
+    std::cout << "[Server] Derived session key." << std::endl;
+
+    return session_key;
+}
+
+
 std::vector<unsigned char> calculate_sha256(const std::vector<unsigned char>& data) {
     std::vector<unsigned char> hash(SHA256_DIGEST_LENGTH);
     SHA256(data.data(), data.size(), hash.data());
@@ -366,7 +451,6 @@ std::vector<unsigned char> receive_message(int sock) {
     uint32_t network_len;
     auto len_buffer = receive_all(sock, sizeof(network_len));
     if (len_buffer.empty()) return {}; 
-
     memcpy(&network_len, len_buffer.data(), sizeof(network_len));
     uint32_t len = ntohl(network_len);
 
@@ -493,6 +577,8 @@ std::string get_server_address_string(const sockaddr_in* addr) {
      inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
      return std::string(ip_str) + ":" + std::to_string(ntohs(addr->sin_port));
 }
+
+
 
 
 void error_exit(const std::string& msg) {

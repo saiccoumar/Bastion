@@ -26,10 +26,22 @@ void init_openssl();
 void cleanup_openssl();
 
 
-
 EVP_PKEY* generate_ecdsa_key();
-
 EVP_PKEY* load_pkey_pem(const std::string& filepath, bool is_public);
+bool save_pkey_pem(EVP_PKEY* pkey, const std::string& filepath, bool is_public);
+std::vector<unsigned char> get_public_key_der(EVP_PKEY* pkey);
+EVP_PKEY* create_pkey_from_public_der(const std::vector<unsigned char>& der_bytes);
+std::string calculate_public_key_fingerprint(EVP_PKEY* public_key);
+std::string bytes_to_hex(const std::vector<unsigned char>& bytes); //
+bool send_message(int sock, const std::vector<unsigned char>& data); //
+std::vector<unsigned char> receive_message(int sock); //
+void init_openssl(); //
+void cleanup_openssl(); //
+void error_exit(const std::string& msg); //
+void print_openssl_errors(const std::string& msg); //
+std::string get_server_address_string(const sockaddr_in* addr); //
+
+
 
 bool save_pkey_pem(EVP_PKEY* pkey, const std::string& filepath, bool is_public);
 
@@ -68,6 +80,8 @@ std::string bytes_to_hex(const std::vector<unsigned char>& bytes);
 std::string calculate_public_key_fingerprint(EVP_PKEY* public_key);
 
 
+unsigned char* perform_server_handshake(int client_sock, const sockaddr_in* client_addr, 
+                            EVP_PKEY* server_static_key, EVP_PKEY*& client_ephemeral_pubkey);
 
 bool send_message(int sock, const std::vector<unsigned char>& data);
 
@@ -93,4 +107,4 @@ std::string get_server_address_string(const sockaddr_in* addr);
 void error_exit(const std::string& msg);
 void print_openssl_errors(const std::string& msg);
 
-#endif 
+#endif
