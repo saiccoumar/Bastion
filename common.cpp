@@ -288,6 +288,78 @@ bool perform_decryption(const std::vector<unsigned char>& ciphertext,
     }
 }
 
+unsigned char* perform_client_handshake(int sock, const std::string& server_address_str,
+                                        EVP_PKEY*& server_static_pubkey_out) {
+    print_openssl_errors("Start client handshake");
+
+    // Receive server's static public key
+    std::vector<unsigned char> server_static_pub_der = receive_message(sock);
+    if (server_static_pub_der.empty()) {
+        std::cerr << "[Client] Failed to receive server static public key." << std::endl;
+        return nullptr;
+    }
+    server_static_pubkey_out = create_pkey_from_public_der(server_static_pub_der);
+    if (!server_static_pubkey_out) {
+        std::cerr << "[Client] Failed to create EVP_PKEY from server static key DER." << std::endl;
+        return nullptr;
+    }
+    std::cout << "[Client] Received server static public key." << std::endl;
+
+    // Receive server's ephemeral public key
+    std::vector<unsigned char> server_ephemeral_pub_der = receive_message(sock);
+    if (server_ephemeral_pub_der.empty()) {
+        std::cerr << "[Client] Failed to receive server ephemeral public key." << std::endl;
+        return nullptr;
+    }
+    EVP_PKEY* server_ephemeral_pubkey = create_pkey_from_public_der(server_ephemeral_pub_der);
+    if (!server_ephemeral_pubkey) {
+        std::cerr << "[Client] Failed to create EVP_PKEY from server ephemeral key DER." << std::endl;
+        return nullptr;
+    }
+    std::cout << "[Client] Received server ephemeral public key." << std::endl;
+
+    // Generate client's ephemeral key for ECDH
+    EVP_PKEY* client_ephemeral_key = generate_ecdh_key();
+    if (!client_ephemeral_key) {
+        std::cerr << "[Client] Failed to generate ephemeral key." << std::endl;
+        EVP_PKEY_free(server_ephemeral_pubkey);
+        return nullptr;
+    }
+
+    // Send client's ephemeral public key to the server
+    std::vector<unsigned char> client_ephemeral_pub_der = get_public_key_der(client_ephemeral_key);
+    if (!send_message(sock, client_ephemeral_pub_der)) {
+        std::cerr << "[Client] Failed to send client ephemeral public key." << std::endl;
+        EVP_PKEY_free(server_ephemeral_pubkey);
+        EVP_PKEY_free(client_ephemeral_key);
+        return nullptr;
+    }
+    std::cout << "[Client] Sent client ephemeral public key." << std::endl;
+
+    // Derive shared secret
+    std::vector<unsigned char> shared_secret = derive_shared_secret(client_ephemeral_key, server_ephemeral_pubkey);
+    EVP_PKEY_free(client_ephemeral_key);   // No longer needed
+    EVP_PKEY_free(server_ephemeral_pubkey); // No longer needed
+
+    if (shared_secret.empty()) {
+        std::cerr << "[Client] Failed to derive shared secret." << std::endl;
+        return nullptr;
+    }
+    std::cout << "[Client] Derived shared secret (size: " << shared_secret.size() << ")." << std::endl;
+
+    // Hash the secret to create the session key
+    std::vector<unsigned char> hashed_secret = calculate_sha256(shared_secret);
+    if (hashed_secret.size() < AES_KEY_SIZE) {
+        std::cerr << "[Client] Hashed secret is too short for an AES key." << std::endl;
+        return nullptr;
+    }
+
+    unsigned char* session_key = new unsigned char[AES_KEY_SIZE];
+    memcpy(session_key, hashed_secret.data(), AES_KEY_SIZE);
+    std::cout << "[Client] Derived session key." << std::endl;
+
+    return session_key;
+}
 
 unsigned char* perform_server_handshake(int client_sock, const sockaddr_in* client_addr, 
                             EVP_PKEY* server_static_key, EVP_PKEY*& client_ephemeral_pubkey) {

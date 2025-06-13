@@ -1,237 +1,259 @@
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 #include <iostream>
 #include <string>
-#include <cstring>
-#include <sys/wait.h>
 #include <vector>
-#include <map>
+#include <thread>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <cstring>
+#include <fstream>
+#include <sys/stat.h>
+#include <wordexp.h>
+#include <termios.h>
+#include <sys/select.h>
+#include <algorithm>
 
-#include "common.h" 
+#include "common.h"
 
-#define PORT 2022
+// Constants for different server ports
+#define AUTH_PORT 2023
+#define PROXY_PORT 2022
 
-unsigned char session_key[AES_KEY_SIZE];
+// The path for the client-specific SSH key
+const std::string CLIENT_KEY_PATH = "~/.ssh/id_rsa_bastion";
 
+// Expands a path like "~/.ssh/file" to its full system path
+std::string expand_path(const std::string& path) {
+    wordexp_t p;
+    if (wordexp(path.c_str(), &p, 0) != 0) {
+        return "";
+    }
+    std::string expanded_path = p.we_wordv[0];
+    wordfree(&p);
+    return expanded_path;
+}
 
-bool perform_client_handshake(int sock, const std::string& server_address_string) {
-    print_openssl_errors("Start client handshake");
-
-    EVP_PKEY* client_ephemeral_key = generate_ecdh_key();
-    if (!client_ephemeral_key) {
-        std::cerr << "[Client] Failed to generate ephemeral key." << std::endl;
-        return false;
+// Function to connect to a server given host and port
+int connect_to_server(const char* hostname, int port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("[Client] Socket creation failed");
+        return -1;
     }
 
-    std::vector<unsigned char> ephemeral_pub_der = get_public_key_der(client_ephemeral_key);
-    if (ephemeral_pub_der.empty()) {
-        EVP_PKEY_free(client_ephemeral_key);
-        return false;
+    struct hostent *server = gethostbyname(hostname);
+    if (server == NULL) {
+        std::cerr << "[Client] Error: No such host " << hostname << std::endl;
+        return -1;
     }
 
-    if (!send_message(sock, ephemeral_pub_der)) {
-        std::cerr << "[Client] Failed to send ephemeral public key." << std::endl;
-        EVP_PKEY_free(client_ephemeral_key);
-        return false;
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    bcopy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr, server->h_length);
+    serv_addr.sin_port = htons(port);
+
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "[Client] Connection failed to " << hostname << ":" << port;
+        perror("");
+        close(sockfd);
+        return -1;
     }
-    std::cout << "[Client] Sent ephemeral public key." << std::endl;
+    std::cout << "[Client] Connected to " << hostname << ":" << port << std::endl;
+    return sockfd;
+}
 
-    // REMOVED: receive_message(sock); // This was the problematic line
+/**
+ * @brief Handles the --register command to exchange SSH keys with the bastion-auth server.
+ */
+void handle_registration(const char* hostname) {
+    std::cout << "[Client] Starting registration with " << hostname << " on port " << AUTH_PORT << "..." << std::endl;
 
-    std::vector<unsigned char> server_static_pub_der = receive_message(sock);
-    if (server_static_pub_der.empty()) {
-        std::cerr << "[Client] Failed to receive server static public key." << std::endl;
-        EVP_PKEY_free(client_ephemeral_key);
-        return false;
-    }
-    std::cout << "[Client] Received server static public key." << std::endl;
+    std::string key_path = expand_path(CLIENT_KEY_PATH);
+    std::string pub_key_path = key_path + ".pub";
 
-    std::vector<unsigned char> server_ephemeral_pub_der = receive_message(sock);
-    if (server_ephemeral_pub_der.empty()) {
-        std::cerr << "[Client] Failed to receive server ephemeral public key." << std::endl;
-        EVP_PKEY_free(client_ephemeral_key);
-        return false;
-    }
-    std::cout << "[Client] Received server ephemeral public key." << std::endl;
-
-    // ... (rest of your client handshake logic) ...
-    // The key processing, fingerprint check, and shared secret derivation
-    // should now work with the correctly received keys.
-
-    EVP_PKEY* server_static_pubkey = create_pkey_from_public_der(server_static_pub_der);
-    EVP_PKEY* server_ephemeral_pubkey = create_pkey_from_public_der(server_ephemeral_pub_der);
-
-    if (!server_static_pubkey || !server_ephemeral_pubkey) {
-        std::cerr << "[Client] Failed to create EVP_PKEYs from server public keys." << std::endl;
-        EVP_PKEY_free(client_ephemeral_key);
-        EVP_PKEY_free(server_static_pubkey); // Potentially NULL, but EVP_PKEY_free handles NULL
-        EVP_PKEY_free(server_ephemeral_pubkey); // Potentially NULL
-        return false;
-    }
-
-    std::string received_fingerprint = calculate_public_key_fingerprint(server_static_pubkey);
-    std::map<std::string, std::string> known_hosts = read_known_hosts();
-
-    auto it = known_hosts.find(server_address_string);
-
-    if (it == known_hosts.end()) {
-        std::cout << "The authenticity of host '" << server_address_string << "' can't be established." << std::endl;
-        std::cout << "ECDSA key fingerprint is SHA256:" << received_fingerprint << "." << std::endl;
-        std::cout << "Warning: Automatically adding '" << server_address_string << "' (ECDSA) to the list of known hosts." << std::endl;
-        known_hosts[server_address_string] = received_fingerprint;
-        if (!write_known_hosts(known_hosts)) {
-            std::cerr << "[Client] Warning: Failed to save host key fingerprint." << std::endl;
+    // Check if key exists, otherwise generate it
+    struct stat buffer;
+    if (stat(key_path.c_str(), &buffer) != 0) {
+        std::cout << "[Client] SSH key not found. Generating a new one at " << key_path << std::endl;
+        std::string command = "ssh-keygen -t rsa -b 4096 -f " + key_path + " -N '' -C 'bastion-client-key'";
+        if (system(command.c_str()) != 0) {
+            std::cerr << "[Client] Failed to generate SSH key. Please ensure ssh-keygen is installed." << std::endl;
+            return;
         }
+    }
+
+    // Read the client's public key from the file
+    std::ifstream pub_key_file(pub_key_path);
+    if (!pub_key_file) {
+        std::cerr << "[Client] Could not read public key file: " << pub_key_path << std::endl;
+        return;
+    }
+    std::string pub_key_str((std::istreambuf_iterator<char>(pub_key_file)), std::istreambuf_iterator<char>());
+
+    // Connect to the bastion-auth server
+    int sock = connect_to_server(hostname, AUTH_PORT);
+    if (sock < 0) return;
+
+    // Perform handshake to establish a secure channel
+    EVP_PKEY* server_static_key = nullptr;
+    unsigned char* session_key = perform_client_handshake(sock, hostname, server_static_key);
+    if (!session_key) {
+        std::cerr << "[Client] Failed to perform secure handshake with auth server." << std::endl;
+        close(sock);
+        EVP_PKEY_free(server_static_key);
+        return;
+    }
+    EVP_PKEY_free(server_static_key);
+
+    // Send the public key over the encrypted channel
+    std::vector<unsigned char> pub_key_bytes(pub_key_str.begin(), pub_key_str.end());
+    if (!send_encrypted_message(sock, pub_key_bytes, session_key)) {
+        std::cerr << "[Client] Failed to send public key to auth server." << std::endl;
     } else {
-        std::string stored_fingerprint = it->second;
-        if (stored_fingerprint != received_fingerprint) {
-            std::cerr << "[Client Error]@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" << std::endl;
-            std::cerr << "[Client Error]@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @" << std::endl;
-            std::cerr << "[Client Error]@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" << std::endl;
-            std::cerr << "[Client Error]IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!" << std::endl;
-            std::cerr << "[Client Error]Someone could be eavesdropping on you right now (man-in-the-middle attack)!" << std::endl;
-            std::cerr << "[Client Error]The fingerprint received from the server is SHA256:" << received_fingerprint << std::endl;
-            std::cerr << "[Client Error]The stored fingerprint for " << server_address_string << " is SHA256:" << stored_fingerprint << std::endl;
+        std::cout << "[Client] Successfully sent public key to the bastion." << std::endl;
+    }
 
-            EVP_PKEY_free(client_ephemeral_key);
-            EVP_PKEY_free(server_static_pubkey);
-            EVP_PKEY_free(server_ephemeral_pubkey);
-            return false;
+    // Receive the bastion's public key in return
+    std::vector<unsigned char> bastion_pubkey_bytes = receive_encrypted_message(sock, session_key);
+    if (bastion_pubkey_bytes.empty()) {
+        std::cerr << "[Client] Failed to receive bastion's public key." << std::endl;
+    } else {
+        std::cout << "[Client] Received bastion's public key." << std::endl;
+        std::string bastion_pubkey(bastion_pubkey_bytes.begin(), bastion_pubkey_bytes.end());
+
+        // Add the bastion's key to the client's known_hosts file
+        std::string known_hosts_path = expand_path("~/.ssh/known_hosts");
+        // Remove any existing entries for this host
+        std::string remove_cmd = "ssh-keygen -f '" + known_hosts_path + "' -R " + hostname;
+        system(remove_cmd.c_str());
+
+        // Add the new key
+        std::ofstream outfile(known_hosts_path, std::ios_base::app);
+        if (outfile) {
+            // Ensure proper formatting: hostname ssh-rsa key
+            std::string formatted_key;
+            // First, check if the key already has the ssh-rsa prefix
+            if (bastion_pubkey.find(std::string("ssh-rsa")) != std::string::npos) {
+                formatted_key = hostname + std::string(" ") + bastion_pubkey;
+            } else {
+                formatted_key = hostname + std::string(" ssh-rsa ") + bastion_pubkey;
+            }
+            outfile << formatted_key;
+            if (formatted_key.back() != '\n') outfile << "\n";
         }
-        std::cout << "[Client] Host key fingerprint verified." << std::endl;
+        std::cout << "[Client] Bastion's public key added to " << known_hosts_path << std::endl;
     }
-    EVP_PKEY_free(server_static_pubkey); // Free static key after use for fingerprint
 
-    std::vector<unsigned char> shared_secret = derive_shared_secret(client_ephemeral_key, server_ephemeral_pubkey);
-    EVP_PKEY_free(client_ephemeral_key);
-    EVP_PKEY_free(server_ephemeral_pubkey);
+    std::cout << "\nRegistration successful!" << std::endl;
+    std::cout << "You can now connect to targets via the bastion using:" << std::endl;
+    std::cout << "  " << "./bastion " << hostname << " your_user@target_machine" << std::endl;
 
-    if (shared_secret.empty()) {
-        std::cerr << "[Client] Failed to derive shared secret." << std::endl;
-        return false;
+    close(sock);
+    delete[] session_key;
+}
+
+/**
+ * @brief Handles the SSH proxy session with the bastion-srv server.
+ */
+void start_proxy_session(const char* hostname, const char* target) {
+    std::cout << "[Client] Starting proxy session to '" << target << "' via " << hostname << " on port " << PROXY_PORT << "..." << std::endl;
+
+    int sock = connect_to_server(hostname, PROXY_PORT);
+    if (sock < 0) return;
+
+    // Perform handshake to establish a secure channel
+    EVP_PKEY* server_static_key = nullptr;
+    unsigned char* session_key = perform_client_handshake(sock, hostname, server_static_key);
+    if (!session_key) {
+        std::cerr << "[Client] Failed to perform secure handshake with proxy server." << std::endl;
+        close(sock);
+        EVP_PKEY_free(server_static_key);
+        return;
     }
-    std::cout << "[Client] Derived shared secret (size: " << shared_secret.size() << ")." << std::endl;
+    EVP_PKEY_free(server_static_key);
 
-    std::vector<unsigned char> hashed_secret = calculate_sha256(shared_secret);
-    if (hashed_secret.size() < AES_KEY_SIZE) { // Assuming AES_KEY_SIZE is defined
-        std::cerr << "[Client] Hashed shared secret is too short for AES key." << std::endl;
-        return false;
+    // Send the encrypted target destination
+    std::string target_str(target);
+    std::vector<unsigned char> target_bytes(target_str.begin(), target_str.end());
+    if (!send_encrypted_message(sock, target_bytes, session_key)) {
+        std::cerr << "[Client] Failed to send target information." << std::endl;
+        close(sock);
+        delete[] session_key;
+        return;
     }
-    // Assuming session_key is a global or member variable accessible here
-    memcpy(session_key, hashed_secret.data(), AES_KEY_SIZE);
-    std::cout << "[Client] Derived session key." << std::endl;
 
-    return true;
+    // Set terminal to raw mode
+    struct termios old_tio, new_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+
+    // Proxy data between stdin/stdout and the server
+    while (true) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        FD_SET(sock, &fds);
+
+        int activity = select(sock + 1, &fds, nullptr, nullptr, nullptr);
+        if (activity < 0) {
+            perror("[Client] Select failed");
+            break;
+        }
+
+        // Data from stdin to send to the server
+        if (FD_ISSET(STDIN_FILENO, &fds)) {
+            char buffer[4096];
+            ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (bytes_read <= 0) break;
+            std::vector<unsigned char> plaintext(buffer, buffer + bytes_read);
+            if (!send_encrypted_message(sock, plaintext, session_key)) {
+                std::cerr << "[Client] Failed to send data to server." << std::endl;
+                break;
+            }
+        }
+
+        // Data from server to print to stdout
+        if (FD_ISSET(sock, &fds)) {
+            std::vector<unsigned char> decrypted_data = receive_encrypted_message(sock, session_key);
+            if (decrypted_data.empty()) {
+                std::cout << "\r\n[Client] Connection closed by server." << std::endl;
+                break;
+            }
+            write(STDOUT_FILENO, decrypted_data.data(), decrypted_data.size());
+        }
+    }
+
+    // Restore terminal settings and cleanup
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+    close(sock);
+    delete[] session_key;
+}
+
+void print_usage(const char* prog_name) {
+    std::cerr << "Usage: " << prog_name << " <bastion_host> [--register | <user@target_host>]" << std::endl;
+    std::cerr << "  --register             : Register this client's new SSH key with the bastion." << std::endl;
+    std::cerr << "  <user@target_host>     : Connect to a target host through the bastion proxy." << std::endl;
 }
 
 int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const char* bastion_host = argv[1];
+    const char* command_or_target = argv[2];
+
     init_openssl();
 
-    if (argc != 3) {
-        std::cerr << "Usage: bastion <server_ip> <user@target>\n";
-        cleanup_openssl();
-        return EXIT_FAILURE;
-    }
-
-    std::string server_ip = argv[1];
-    std::string target = argv[2];
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) error_exit("[Client Error] Socket creation failed");
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-
-    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
-         close(sock);
-         error_exit("[Client Error] Invalid server address");
-    }
-
-    if (connect(sock, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-         close(sock);
-         error_exit("[Client Error] Could not connect to bastion server");
-    }
-
-    std::string server_address_string = get_server_address_string(&server_addr);
-    std::cout << "[Client] Connected to " << server_address_string << ". Performing handshake..." << std::endl;
-
-    
-    if (!perform_client_handshake(sock, server_address_string)) {
-        std::cerr << "[Client] Secure handshake failed. Aborting." << std::endl;
-        close(sock);
-        cleanup_openssl();
-        return EXIT_FAILURE;
-    }
-     std::cout << "[Client] Handshake successful. Sending encrypted target." << std::endl;
-
-
-    
-    std::vector<unsigned char> target_bytes(target.begin(), target.end());
-    if (!send_encrypted_message(sock, target_bytes, session_key)) {
-        std::cerr << "[Client] Failed to send encrypted target." << std::endl;
-        close(sock);
-        cleanup_openssl();
-        return EXIT_FAILURE;
-    }
-     std::cout << "[Client] Encrypted target sent. Starting secure proxy." << std::endl;
-
-
-    
-    pid_t pid = fork();
-     if (pid < 0) {
-         std::cerr << "[Client Error] Fork failed: " << strerror(errno) << std::endl;
-         close(sock);
-         cleanup_openssl();
-         return EXIT_FAILURE;
-    }
-
-
-    if (pid == 0) {
-        // Child process: Read from stdin and send encrypted data to the server
-        char buf[4096];
-        while (true) {
-            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-            if (n < 0) {
-                perror("[Client Child] Error reading from stdin");
-                break;
-            }
-            if (n == 0) break; // EOF
-
-            std::vector<unsigned char> plaintext(buf, buf + n);
-            if (!send_encrypted_message(sock, plaintext, session_key)) {
-                std::cerr << "[Client Child] Failed to send encrypted data." << std::endl;
-                break;
-            }
-        }
-
-        close(sock);
-        exit(0);
+    if (strcmp(command_or_target, "--register") == 0) {
+        handle_registration(bastion_host);
     } else {
-        // Parent process: Receive encrypted data from the server and write to stdout
-        while (true) {
-            std::vector<unsigned char> plaintext = receive_encrypted_message(sock, session_key);
-            if (plaintext.empty()) {
-                if (errno != 0) {
-                    std::cerr << "[Client Parent] Error receiving/decrypting data: " << strerror(errno) << std::endl;
-                } else {
-                    std::cout << "[Client Parent] Server closed connection." << std::endl;
-                }
-                break;
-            }
-
-            if (write(STDOUT_FILENO, plaintext.data(), plaintext.size()) < 0) {
-                perror("[Client Parent] Error writing to stdout");
-                break;
-            }
-        }
-
-        waitpid(pid, nullptr, 0);
+        start_proxy_session(bastion_host, command_or_target);
     }
 
-    
-    close(sock);
     cleanup_openssl();
     return 0;
 }

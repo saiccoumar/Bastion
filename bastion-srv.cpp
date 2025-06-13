@@ -1,6 +1,6 @@
-#include <libssh/libssh.h> 
-#include <libssh/callbacks.h> 
-#include <libssh/server.h> 
+#include <libssh/libssh.h>
+#include <libssh/callbacks.h>
+#include <libssh/server.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <iostream>
@@ -10,181 +10,267 @@
 #include <sys/wait.h>
 #include <thread>
 #include <vector>
-#include <pty.h> // Include for forkpty
-
-#include "common.h" 
+#include <pty.h>      // Include for forkpty
+#include <algorithm>  // For std::max
+#include <errno.h>    // For errno
+#include <openssl/ec.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#include "common.h"
 
 #define PORT 2022
 const std::string SERVER_STATIC_KEY_FILE = "server_static_key.pem";
 
 EVP_PKEY* server_static_key = NULL;
-// unsigned char session_key[AES_KEY_SIZE];
+// unsigned char session_key[AES_KEY_SIZE]; // Global session_key is not used; it's per-client.
 
 
+// Definition for perform_server_handshake is expected in common.h/common.cpp
+// It should populate its last EVP_PKEY* argument (e.g., passed by reference EVP_PKEY*&).
+// Example signature in common.h:
+// unsigned char* perform_server_handshake(int sock, const struct sockaddr_in* client_addr,
+//                                         EVP_PKEY* server_static_key,
+//                                         EVP_PKEY*& client_ephemeral_pubkey_out);
 
 void handle_client(int client_sock, sockaddr_in client_addr) {
-    print_openssl_errors("Start handle_client");
+    print_openssl_errors("Start handle_client for bastion-srv");
 
-    EVP_PKEY* client_ephemeral_pubkey = NULL;
-    
-    unsigned char* session_key = perform_server_handshake(client_sock, &client_addr, 
-                                                        server_static_key, client_ephemeral_pubkey);
-    
+    EVP_PKEY* p_client_ephemeral_pubkey = NULL; // To be populated by perform_server_handshake
+    unsigned char* session_key = perform_server_handshake(client_sock, &client_addr,
+                                                        server_static_key, p_client_ephemeral_pubkey);
+
     if (!session_key) {
-        std::cerr << "[Server] Handshake failed for client." << std::endl;
+        std::cerr << "[Server SRV] Handshake failed for client: " << get_server_address_string(&client_addr) << std::endl;
         close(client_sock);
-        EVP_PKEY_free(client_ephemeral_pubkey);
+        EVP_PKEY_free(p_client_ephemeral_pubkey);
         return;
     }
-    std::cout << "[Server] Handshake successful. Starting secure communication." << std::endl;
+    std::cout << "[Server SRV] Handshake successful with " << get_server_address_string(&client_addr) << "." << std::endl;
 
-    EVP_PKEY_free(client_ephemeral_pubkey);
+    // --- Client Authorization Placeholder ---
+    if (p_client_ephemeral_pubkey) {
+        std::string client_fingerprint = calculate_public_key_fingerprint(p_client_ephemeral_pubkey);
+        std::cout << "[Server SRV] Client ephemeral public key fingerprint: SHA256:" << client_fingerprint << std::endl;
 
-    std::vector<unsigned char> encrypted_target_bytes = receive_encrypted_message(client_sock, session_key);
+        // TODO: Implement actual authorization check against a database of registered clients.
+        // bool is_authorized = check_client_authorization_in_db(client_fingerprint, /* target_info?, user_identity? */);
+        // if (!is_authorized) {
+        //     std::cerr << "[Server SRV] Client " << client_fingerprint << " (" << get_server_address_string(&client_addr)
+        //               << ") is not authorized. Closing connection." << std::endl;
+        //     // Optionally, send an encrypted error message to the client before closing.
+        //     // send_encrypted_message(client_sock, std::vector<unsigned char>("Client not authorized."), session_key);
+        //     close(client_sock);
+        //     delete[] session_key;
+        //     EVP_PKEY_free(p_client_ephemeral_pubkey);
+        //     return;
+        // }
+        // std::cout << "[Server SRV] Client " << client_fingerprint << " conceptually authorized." << std::endl;
+    } else {
+        std::cerr << "[Server SRV] Warning: Could not obtain client ephemeral public key for authorization check for "
+                  << get_server_address_string(&client_addr) << "." << std::endl;
+        // Depending on security policy, you might deny service here.
+    }
+    EVP_PKEY_free(p_client_ephemeral_pubkey); // Free client's key after check (or if NULL)
+    p_client_ephemeral_pubkey = NULL;         // Avoid dangling pointer issues
+
+    // Receive encrypted target
+    std::vector<unsigned char> encrypted_target_bytes = receive_encrypted_message(client_sock, session_key); //
     if (encrypted_target_bytes.empty()) {
-        std::cerr << "[Server] Failed to receive encrypted target or decryption failed." << std::endl;
+        std::cerr << "[Server SRV] Failed to receive encrypted target or decryption failed from "
+                  << get_server_address_string(&client_addr) << "." << std::endl;
         close(client_sock);
         delete[] session_key;
         return;
     }
-
     std::string target(encrypted_target_bytes.begin(), encrypted_target_bytes.end());
-    std::cout << "[Server] Decrypted target: " << target << std::endl;
+    std::cout << "[Server SRV] Decrypted target '" << target << "' from " << get_server_address_string(&client_addr) << "." << std::endl;
 
-    
-    pid_t pid = fork();
+    pid_t pid = fork(); //
     if (pid < 0) {
-         std::cerr << "[Server Error] Fork failed: " << strerror(errno) << std::endl;
-         close(client_sock);
-         delete[] session_key;
-         return;
+        std::cerr << "[Server SRV Error] Fork failed for client " << get_server_address_string(&client_addr) << ": " << strerror(errno) << std::endl;
+        close(client_sock);
+        delete[] session_key; // Clean up session key if fork fails
+        return;
     }
 
-    if (pid == 0) {
-        // Child process
-        int pipe_in[2], pipe_out[2];
-        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
-            perror("[Server Error] pipe creation failed");
-            close(client_sock);
-            delete[] session_key;
-            exit(EXIT_FAILURE);
-        }
-
+    if (pid == 0) { // Child process: This process will proxy data
         int master_fd; // File descriptor for the master side of the pseudo-terminal
-        pid_t ssh_pid = forkpty(&master_fd, nullptr, nullptr, nullptr);
+        pid_t ssh_pid = forkpty(&master_fd, nullptr, nullptr, nullptr); //
         if (ssh_pid < 0) {
-            perror("[Server Error] forkpty failed for SSH process");
-            close(client_sock);
+            perror("[Server SRV Error] forkpty failed for SSH process");
+            close(client_sock); // Close client connection before exiting
             delete[] session_key;
             exit(EXIT_FAILURE);
         }
 
-        if (ssh_pid == 0) {
-            // Grandchild process (SSH)
+        if (ssh_pid == 0) { // Grandchild process: This becomes the SSH client
+            // Close inherited client socket descriptor as SSH process doesn't need it
+            close(client_sock);
+
             unsetenv("DISPLAY");
             unsetenv("SSH_ASKPASS");
-
-            // Execute the SSH command
-            execlp("ssh", "ssh", "-tt", target.c_str(), nullptr);
-
-            // If execlp fails, log the error and exit
-            perror("[Server Error] execlp ssh failed");
+            execlp("ssh", "ssh", "-tt", target.c_str(), nullptr); //
+            // If execlp returns, it's an error
+            perror("[Server SRV Error] execlp ssh failed");
             exit(EXIT_FAILURE);
-        } else {
-            // Child process (Server-side proxy)
-            close(pipe_in[0]);  // Close read end of input pipe
-            close(pipe_out[1]); // Close write end of output pipe
+        } else { // Child process (still): This is the server-side proxy managing PTY
+            std::cout << "[Server SRV] SSH process forked with PID " << ssh_pid << " for target '" << target
+                      << "' (client: " << get_server_address_string(&client_addr) << ")." << std::endl;
 
-            // Use `select` for bidirectional communication
             fd_set read_fds;
-            int max_fd = std::max(client_sock, master_fd);
-
-            char buffer[4096];
+            char buffer[4096]; // Buffer for data from PTY to client
             ssize_t bytes_read;
+            bool running = true;
 
-            while (true) {
+            while (running) {
                 FD_ZERO(&read_fds);
-                FD_SET(client_sock, &read_fds);  // Monitor client socket
-                FD_SET(master_fd, &read_fds);   // Monitor SSH PTY
+                FD_SET(client_sock, &read_fds); // Monitor client socket for data
+                FD_SET(master_fd, &read_fds);   // Monitor SSH PTY for data
+                int max_fd = std::max(client_sock, master_fd);
 
-                if (select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
-                    perror("[Server Error] select failed");
+                int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr);
+                if (activity < 0) {
+                    if (errno == EINTR) continue; // Interrupted by a signal, restart select
+                    perror("[Server SRV Error] select failed in proxy");
+                    running = false;
                     break;
                 }
+                if (activity == 0) continue; // Should not happen with NULL timeout
 
-                // Data from the SSH process to the client
+                // Data from the SSH process (master_fd) to the client (client_sock)
                 if (FD_ISSET(master_fd, &read_fds)) {
-                    bytes_read = read(master_fd, buffer, sizeof(buffer));
-                    if (bytes_read <= 0) break; // EOF or error
-
+                    bytes_read = read(master_fd, buffer, sizeof(buffer)); //
+                    if (bytes_read <= 0) { // EOF or error from SSH process
+                        if (bytes_read < 0) perror("[Server SRV Info] read from SSH PTY failed");
+                        else std::cout << "[Server SRV Info] SSH PTY (master_fd) closed (EOF) for target '" << target << "'." << std::endl;
+                        running = false;
+                        break;
+                    }
                     std::vector<unsigned char> plaintext(buffer, buffer + bytes_read);
-                    if (!send_encrypted_message(client_sock, plaintext, session_key)) {
-                        std::cerr << "[Server] Failed to send encrypted data to client." << std::endl;
+                    if (!send_encrypted_message(client_sock, plaintext, session_key)) { //
+                        std::cerr << "[Server SRV] Failed to send encrypted data to client "
+                                  << get_server_address_string(&client_addr) << ": " << strerror(errno) << std::endl;
+                        running = false;
                         break;
                     }
                 }
 
-                // Data from the client to the SSH process
+                // Data from the client (client_sock) to the SSH process (master_fd)
                 if (FD_ISSET(client_sock, &read_fds)) {
-                    std::vector<unsigned char> encrypted_data = receive_encrypted_message(client_sock, session_key);
-                    if (encrypted_data.empty()) {
-                        std::cerr << "[Server] Failed to receive encrypted data from client." << std::endl;
+                    std::vector<unsigned char> decrypted_data = receive_encrypted_message(client_sock, session_key); //
+                    if (decrypted_data.empty()) { // Decryption failed or client closed connection
+                        if (errno != 0 && errno != ECONNRESET && errno != EPIPE) { // Check if it was an actual error vs clean close
+                             std::cerr << "[Server SRV] Failed to receive/decrypt data from client "
+                                       << get_server_address_string(&client_addr) << ": " << strerror(errno) << std::endl;
+                        } else {
+                             std::cout << "[Server SRV Info] Client " << get_server_address_string(&client_addr)
+                                       << " closed connection or sent no data for target '" << target << "'." << std::endl;
+                        }
+                        running = false;
                         break;
                     }
-
-                    // Write decrypted data to the SSH process
-                    if (write(master_fd, encrypted_data.data(), encrypted_data.size()) < 0) {
-                        perror("[Server Error] Failed to write to SSH process");
+                    if (write(master_fd, decrypted_data.data(), decrypted_data.size()) < 0) { //
+                        perror("[Server SRV Error] Failed to write to SSH process PTY");
+                        running = false;
                         break;
                     }
                 }
-            }
+            } // end while(running)
 
-            // Close pipes and socket
-            close(pipe_in[1]);
-            close(master_fd);
-            close(client_sock);
+            std::cout << "[Server SRV] Proxy loop terminated for target '" << target
+                      << "' (client: " << get_server_address_string(&client_addr) << ")." << std::endl;
+
+            // Close descriptors
+            close(master_fd);   // This will typically send SIGHUP to the PTY slave (SSH)
+            close(client_sock); // Close client socket
 
             // Wait for the SSH process to finish
-            int status;
-            waitpid(ssh_pid, &status, 0);
-            std::cout << "[Server] SSH process finished with status " << status << "." << std::endl;
-            delete[] session_key;
-            exit(EXIT_SUCCESS);
+            int status = 0;
+            waitpid(ssh_pid, &status, 0); //
+            if (WIFEXITED(status)) {
+                std::cout << "[Server SRV] SSH process (PID " << ssh_pid << ") for '" << target << "' exited with status " << WEXITSTATUS(status) << "." << std::endl;
+            } else if (WIFSIGNALED(status)) {
+                std::cout << "[Server SRV] SSH process (PID " << ssh_pid << ") for '" << target << "' killed by signal " << WTERMSIG(status) << "." << std::endl;
+            } else {
+                std::cout << "[Server SRV] SSH process (PID " << ssh_pid << ") for '" << target << "' finished (status: " << status << ")." << std::endl;
+            }
+
+            delete[] session_key; // Child proxy process cleans up the session key
+            exit(EXIT_SUCCESS);   // Child proxy process exits
         }
+    } else { // Parent process (this is the handle_client thread after fork)
+        // The parent (handle_client thread) has handed off responsibility to the child process 'pid'.
+        // It must close its copy of client_sock.
+        // It must NOT delete session_key, as the child process 'pid' needs it.
+        close(client_sock);
+        std::cout << "[Server SRV] Parent (handle_client thread) forked child PID " << pid << " to handle client "
+                  << get_server_address_string(&client_addr) << " for target '" << target << "'. Parent thread continuing." << std::endl;
+        // The 'handle_client' thread will now return, and the detached thread will terminate.
+        // The child 'pid' continues execution independently.
     }
-    delete[] session_key;
+    // CRITICAL: Do NOT delete session_key here. The child process (pid==0) is responsible for it.
+    // The original bastion-srv.cpp had a delete[] session_key; here, which was a bug.
 }
 
 int main() {
     init_openssl();
 
-    
-    server_static_key = load_pkey_pem(SERVER_STATIC_KEY_FILE, false); 
+    server_static_key = load_pkey_pem(SERVER_STATIC_KEY_FILE, false);
     if (!server_static_key) {
         std::cerr << "[Server] Static key not found. Generating new key pair..." << std::endl;
-        server_static_key = generate_ecdsa_key();
+        
+        // Generate ECDSA key with explicit parameters
+        server_static_key = EVP_PKEY_new();
         if (!server_static_key) {
-            error_exit("[Server] Failed to generate static key.");
+            error_exit("[Server] Failed to create EVP_PKEY structure");
         }
-        if (!save_pkey_pem(server_static_key, SERVER_STATIC_KEY_FILE, false)) { 
-             EVP_PKEY_free(server_static_key);
-             server_static_key = NULL;
-             error_exit("[Server] Failed to save static key.");
+
+        EC_KEY* ec_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        if (!ec_key) {
+            EVP_PKEY_free(server_static_key);
+            error_exit("[Server] Failed to create EC_KEY structure");
         }
+
+        if (!EC_KEY_generate_key(ec_key)) {
+            EC_KEY_free(ec_key);
+            EVP_PKEY_free(server_static_key);
+            error_exit("[Server] Failed to generate EC key pair");
+        }
+
+        if (!EVP_PKEY_assign_EC_KEY(server_static_key, ec_key)) {
+            EC_KEY_free(ec_key);
+            EVP_PKEY_free(server_static_key);
+            error_exit("[Server] Failed to assign EC key to EVP_PKEY");
+        }
+
+        // Save the key in PEM format
+        FILE* f = fopen(SERVER_STATIC_KEY_FILE.c_str(), "wb");
+        if (!f) {
+            EVP_PKEY_free(server_static_key);
+            error_exit("[Server] Failed to open file for writing static key");
+        }
+
+        if (!PEM_write_PrivateKey(f, server_static_key, NULL, NULL, 0, NULL, NULL)) {
+            fclose(f);
+            EVP_PKEY_free(server_static_key);
+            error_exit("[Server] Failed to write static key to file");
+        }
+
+        fclose(f);
         std::cout << "[Server] Generated and saved new static key pair to " << SERVER_STATIC_KEY_FILE << std::endl;
-         std::cout << "[Server] Static Key Fingerprint: " << calculate_public_key_fingerprint(server_static_key) << std::endl;
+        std::cout << "[Server] Static Key Fingerprint: " << calculate_public_key_fingerprint(server_static_key) << std::endl;
     } else {
-         std::cout << "[Server] Loaded static key from " << SERVER_STATIC_KEY_FILE << std::endl;
-         std::cout << "[Server] Static Key Fingerprint: " << calculate_public_key_fingerprint(server_static_key) << std::endl;
+        std::cout << "[Server] Loaded static key from " << SERVER_STATIC_KEY_FILE << std::endl;
+        std::cout << "[Server] Static Key Fingerprint: " << calculate_public_key_fingerprint(server_static_key) << std::endl;
     }
 
-
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) error_exit("[Server Error] Socket creation failed");
+    if (sockfd < 0) error_exit("[Server SRV Error] Socket creation failed");
 
     int opt = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("[Server SRV Warning] setsockopt(SO_REUSEADDR) failed");
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -192,25 +278,25 @@ int main() {
     addr.sin_port = htons(PORT);
 
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-        error_exit("[Server Error] Bind failed");
+        error_exit("[Server SRV Error] Bind failed");
 
-    if (listen(sockfd, 5) < 0)
-        error_exit("[Server Error] Listen failed");
+    if (listen(sockfd, 10) < 0) // Increased backlog slightly
+        error_exit("[Server SRV Error] Listen failed");
 
-    std::cout << "[Server] Listening securely on port " << PORT << std::endl;
+    std::cout << "[Server SRV] SSH proxy server listening securely on port " << PORT << std::endl;
 
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
+        // The TODO for checking client key/fingerprint was here, but it's better done inside handle_client.
         int client_sock = accept(sockfd, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
-            std::cerr << "[Server] Accept failed: " << strerror(errno) << std::endl;
+            perror("[Server SRV Error] Accept failed"); // Log error but continue server operation
             continue;
         }
+        std::cout << "[Server SRV] Connection accepted from " << get_server_address_string(&client_addr) << std::endl;
 
-        std::cout << "[Server] Connection accepted from " << get_server_address_string(&client_addr) << std::endl;
-        
-        
+        // Detach thread to handle client connection concurrently
         std::thread(handle_client, client_sock, client_addr).detach();
     }
 
