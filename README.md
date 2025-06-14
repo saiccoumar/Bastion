@@ -36,7 +36,9 @@ In the event that a machine is compromised in a network without Bastion, all dev
 
 ## Example of redundancy with bastion
 <div align="center">
+  
 ![bastion_with_redundancy drawio](https://github.com/user-attachments/assets/d1805347-8b7c-4714-9324-a50b33d39b11)
+  
 </div>
 
 Bastion can also be deployed in a redundant configuration. Because Bastion is built directly on ssh protocol, creating another jump point for the connection to proxy through is as simple as just creating a new Bastion server and using whichever one is available to reach a target machine. In the future, I hope to add key syncing and load balancing so that Bastion can automatically handle high volume connections.
