@@ -69,7 +69,7 @@ void handle_registration(const char* hostname) {
     struct stat buffer;
     if (stat(key_path.c_str(), &buffer) != 0) {
         std::cout << "[Client] SSH key not found. Generating a new one at " << key_path << std::endl;
-        std::string command = "ssh-keygen -t rsa -b 4096 -f " + key_path + " -N '' -C 'bastion-client-key'";
+        std::string command = "ssh-keygen -t rsa -b 4096 -f " + key_path + " -N '' -C 'bastion-client-key_" + getCurrentTimestamp() + "'";
         if (system(command.c_str()) != 0) {
             std::cerr << "[Client] Failed to generate SSH key. Please ensure ssh-keygen is installed." << std::endl;
             return;

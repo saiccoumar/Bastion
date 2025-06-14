@@ -677,3 +677,21 @@ std::string expand_path(const std::string& path) {
     wordfree(&p);
     return expanded_path;
 }
+
+std::string getCurrentTimestamp()
+{
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    struct tm localTime;
+
+#if defined(_WIN32)
+    localtime_s(&localTime, &time);
+#else
+    localtime_r(&time, &localTime);
+#endif
+
+    std::stringstream ss;
+    ss << std::put_time(&localTime, "%Y-%m-%d_%H-%M-%S");
+
+    return ss.str();
+}

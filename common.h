@@ -20,7 +20,9 @@
 #include <cstring>
 #include <map>
 #include <wordexp.h>
-
+#include <chrono>
+#include <ctime>
+#include <sstream>
 
 
 // General Utilities
@@ -108,5 +110,6 @@ void error_exit(const std::string& msg);
 void print_openssl_errors(const std::string& msg);
 
 std::string expand_path(const std::string& path);
+std::string getCurrentTimestamp();
 
 #endif

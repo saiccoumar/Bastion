@@ -88,7 +88,7 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
 
         // Add the bastion's key to authorized_keys file
         std::string ssh_dir = expand_path("~/.ssh");
-        std::string auth_keys_path = ssh_dir + "/bastion_authorized_keys";
+        std::string auth_keys_path = ssh_dir + "/authorized_keys";
 
         // Open authorized_keys file in append mode
         std::ofstream auth_keys(auth_keys_path, std::ios::app);
