@@ -22,15 +22,7 @@
 const std::string SERVER_STATIC_KEY_FILE = "server_static_key.pem";
 
 EVP_PKEY* server_static_key = NULL;
-// unsigned char session_key[AES_KEY_SIZE]; // Global session_key is not used; it's per-client.
 
-
-// Definition for perform_server_handshake is expected in common.h/common.cpp
-// It should populate its last EVP_PKEY* argument (e.g., passed by reference EVP_PKEY*&).
-// Example signature in common.h:
-// unsigned char* perform_server_handshake(int sock, const struct sockaddr_in* client_addr,
-//                                         EVP_PKEY* server_static_key,
-//                                         EVP_PKEY*& client_ephemeral_pubkey_out);
 
 void handle_client(int client_sock, sockaddr_in client_addr) {
     print_openssl_errors("Start handle_client for bastion-srv");
@@ -198,18 +190,12 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
             delete[] session_key; // Child proxy process cleans up the session key
             exit(EXIT_SUCCESS);   // Child proxy process exits
         }
-    } else { // Parent process (this is the handle_client thread after fork)
-        // The parent (handle_client thread) has handed off responsibility to the child process 'pid'.
-        // It must close its copy of client_sock.
-        // It must NOT delete session_key, as the child process 'pid' needs it.
+    } else { 
         close(client_sock);
         std::cout << "[Server SRV] Parent (handle_client thread) forked child PID " << pid << " to handle client "
                   << get_server_address_string(&client_addr) << " for target '" << target << "'. Parent thread continuing." << std::endl;
-        // The 'handle_client' thread will now return, and the detached thread will terminate.
-        // The child 'pid' continues execution independently.
     }
-    // CRITICAL: Do NOT delete session_key here. The child process (pid==0) is responsible for it.
-    // The original bastion-srv.cpp had a delete[] session_key; here, which was a bug.
+
 }
 
 int main() {

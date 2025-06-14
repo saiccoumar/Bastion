@@ -25,7 +25,6 @@ const std::string SERVER_STATIC_KEY_FILE = "server_static_key.pem";
 const std::string SERVER_KEY_PATH = "~/.ssh/id_rsa_bastion_auth";
 
 EVP_PKEY* server_static_key = NULL;
-// unsigned char session_key[AES_KEY_SIZE];
 
 volatile sig_atomic_t running = 1;
 

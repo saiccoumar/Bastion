@@ -11,12 +11,12 @@ LIBS_BASTION_SRV = -lssh
 SRC_COMMON = common.cpp
 SRC_BASTION = bastion.cpp $(SRC_COMMON)
 SRC_BASTION_SRV = bastion-srv.cpp $(SRC_COMMON)
-# Renamed source file variable and updated the source filename
 SRC_BASTION_AUTH = bastion-auth.cpp $(SRC_COMMON)
+SRC_CLEAN_AUTHORIZED_KEYS = clean_authorized_keys.cpp
 
 # Executables
-# Updated target name in the list
-TARGETS = bastion bastion-srv bastion-auth
+# Updated target list
+TARGETS = bastion bastion-srv bastion-auth clean_authorized_keys
 
 all: $(TARGETS)
 
@@ -26,11 +26,11 @@ bastion: $(SRC_BASTION)
 bastion-srv: $(SRC_BASTION_SRV)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS_COMMON) $(LIBS_BASTION_SRV)
 
-# Renamed target and updated source variable
 bastion-auth: $(SRC_BASTION_AUTH)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS_COMMON)
 
-clean:
-	rm -f $(TARGETS) *.pem *.db # Added *.pem and *.db to clean up generated key/db files
+clean_authorized_keys: $(SRC_CLEAN_AUTHORIZED_KEYS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ 
 
-.PHONY: all clean
+clean:
+	rm -f $(TARGETS) *.pem *.db # Added *.pem and *.db to clean up generated key/db f
