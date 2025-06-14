@@ -39,6 +39,115 @@ std::vector<unsigned char> string_to_vector(const std::string& str) {
 void handle_client(int client_sock, sockaddr_in client_addr) {
     print_openssl_errors("Start handle_client");
 
+
+    // Perform handshake
+    
+    EVP_PKEY *p_client_ephemeral_pubkey = NULL; // To be populated by perform_server_handshake
+    unsigned char *session_key = perform_server_handshake(client_sock, &client_addr,
+                                                          server_static_key, p_client_ephemeral_pubkey);
+
+    if (!session_key)
+    {
+        std::cerr << "[Server SRV] Handshake failed for client: " << get_server_address_string(&client_addr) << std::endl;
+        close(client_sock);
+        EVP_PKEY_free(p_client_ephemeral_pubkey);
+        return;
+    }
+    std::cout << "[Server SRV] Handshake successful with " << get_server_address_string(&client_addr) << "." << std::endl;
+
+    // --- START PASSWORD AUTHENTICATION ---
+    if (p_client_ephemeral_pubkey)
+    {
+        std::string client_fingerprint = calculate_public_key_fingerprint(p_client_ephemeral_pubkey);
+        std::cout << "[Server SRV] Client ephemeral public key fingerprint: SHA256:" << client_fingerprint << std::endl;
+
+
+        // --- Client Authorization (Now with Password Auth) ---
+        bool is_authorized = false;
+        // Receive username
+        std::vector<unsigned char> encrypted_username_bytes = receive_encrypted_message(client_sock, session_key);
+        if (encrypted_username_bytes.empty())
+        {
+            std::cerr << "[Server SRV] Failed to receive username from " << get_server_address_string(&client_addr) << "." << std::endl;
+        }
+        else
+        {
+            std::string username(encrypted_username_bytes.begin(), encrypted_username_bytes.end());
+
+            // Receive password
+            std::vector<unsigned char> encrypted_password_bytes = receive_encrypted_message(client_sock, session_key);
+            if (encrypted_password_bytes.empty())
+            {
+                std::cerr << "[Server SRV] Failed to receive password from " << get_server_address_string(&client_addr) << "." << std::endl;
+            }
+            else
+            {
+                std::string password(encrypted_password_bytes.begin(), encrypted_password_bytes.end());
+
+                // --- PAM Authentication ---
+                pam_handle_t *pamh = NULL;
+                const char *pam_service_name = "sshd"; // Use the 'sshd' service for robust configuration
+                struct pam_conv conv = {pam_conversation, (void *)password.c_str()};
+
+                int retval = pam_start(pam_service_name, username.c_str(), &conv, &pamh);
+
+                if (retval == PAM_SUCCESS)
+                {
+                    retval = pam_authenticate(pamh, 0); // Authenticate the user
+                }
+
+                if (retval == PAM_SUCCESS)
+                {
+                    retval = pam_acct_mgmt(pamh, 0); // Check if account is valid
+                }
+
+                if (retval == PAM_SUCCESS)
+                {
+                    std::cout << "[Server SRV] PAM authentication successful for user '" << username << "." << std::endl;
+                    is_authorized = true;
+                }
+                else
+                {
+                    std::cerr << "[Server SRV] PAM authentication failed for user '" << username << "': " << pam_strerror(pamh, retval) << std::endl;
+                }
+
+                if (pamh)
+                {
+                    pam_end(pamh, retval);
+                }
+            }
+        }
+
+        // Send authorization status to client
+        const char *auth_status_msg = is_authorized ? "AUTH_SUCCESS" : "AUTH_FAILURE";
+        std::vector<unsigned char> auth_status_bytes(auth_status_msg, auth_status_msg + strlen(auth_status_msg));
+        if (!send_encrypted_message(client_sock, auth_status_bytes, session_key))
+        {
+            std::cerr << "[Server SRV] Failed to send auth status to client." << std::endl;
+            is_authorized = false; // Prevent proceeding if we can't communicate status
+        }
+
+        if (!is_authorized)
+        {
+            std::cerr << "[Server SRV] Authorization failed. Closing connection for " << get_server_address_string(&client_addr) << "." << std::endl;
+            close(client_sock);
+            delete[] session_key;
+            EVP_PKEY_free(p_client_ephemeral_pubkey);
+            return;
+        }
+
+        // -- END CLIENT PASSWORD AUTHENTICATION
+    }
+    else
+    {
+        std::cerr << "[Server SRV] Warning: Could not obtain client ephemeral public key for authorization check for "
+                  << get_server_address_string(&client_addr) << "." << std::endl;
+        // Depending on security policy, you might deny service here.
+    }
+    EVP_PKEY_free(p_client_ephemeral_pubkey); // Free client's key after check (or if NULL)
+    p_client_ephemeral_pubkey = NULL;
+
+    
     // GENERATE KEY:
 
     // Replace absolute paths with expanded path
@@ -64,18 +173,6 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
     }
     std::string pub_key_str((std::istreambuf_iterator<char>(pub_key_file)), std::istreambuf_iterator<char>());
 
-    // HANDSHAKE: Perform handshake to establish a secure channel
-    EVP_PKEY* client_ephemeral_pubkey = NULL;
-    unsigned char* session_key = perform_server_handshake(client_sock, &client_addr, server_static_key, client_ephemeral_pubkey);
-    if (!session_key) {
-        std::cerr << "[Server] Handshake failed for client." << std::endl;
-        close(client_sock);
-        EVP_PKEY_free(client_ephemeral_pubkey);
-        return;
-    }
-    std::cout << "[Server] Handshake successful. Starting secure communication." << std::endl;
-
-    EVP_PKEY_free(client_ephemeral_pubkey);
 
     // ACTION A: Receive client's public key
     std::vector<unsigned char> client_pubkey_bytes = receive_encrypted_message(client_sock, session_key);

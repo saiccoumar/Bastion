@@ -27,6 +27,7 @@ void handle_client(int client_sock, sockaddr_in client_addr)
 {
     print_openssl_errors("Start handle_client for bastion-srv");
 
+    // Perform handshake
     EVP_PKEY *p_client_ephemeral_pubkey = NULL; // To be populated by perform_server_handshake
     unsigned char *session_key = perform_server_handshake(client_sock, &client_addr,
                                                           server_static_key, p_client_ephemeral_pubkey);
@@ -46,7 +47,7 @@ void handle_client(int client_sock, sockaddr_in client_addr)
         std::string client_fingerprint = calculate_public_key_fingerprint(p_client_ephemeral_pubkey);
         std::cout << "[Server SRV] Client ephemeral public key fingerprint: SHA256:" << client_fingerprint << std::endl;
 
-        // TODO: Implement actual authorization check against a database of registered clients.
+
         // --- Client Authorization (Now with Password Auth) ---
         bool is_authorized = false;
         // Receive username

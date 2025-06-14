@@ -55,11 +55,85 @@ int connect_to_server(const char *hostname, int port)
 }
 
 /**
+ * @brief Performs password authentication with the server over an encrypted channel.
+ * @param sock The connected socket to the server
+ * @param session_key The session key for encrypted communication
+ * @return true if authentication succeeds, false otherwise
+ */
+bool perform_password_authentication(int sock, unsigned char *session_key)
+{
+    // Get username and password from user
+    std::string username;
+    std::cout << "Username: ";
+    std::getline(std::cin, username);
+    std::string password = get_password_from_stdin(); // Securely get password
+
+    // Send username
+    std::vector<unsigned char> username_bytes(username.begin(), username.end());
+    if (!send_encrypted_message(sock, username_bytes, session_key))
+    {
+        std::cerr << "[Client] Failed to send username." << std::endl;
+        return false;
+    }
+
+    // Send password
+    std::vector<unsigned char> password_bytes(password.begin(), password.end());
+    if (!send_encrypted_message(sock, password_bytes, session_key))
+    {
+        std::cerr << "[Client] Failed to send password." << std::endl;
+        return false;
+    }
+
+    // Receive and check authorization status
+    std::vector<unsigned char> auth_status_bytes = receive_encrypted_message(sock, session_key);
+    if (auth_status_bytes.empty())
+    {
+        std::cerr << "[Client] Did not receive authorization status from server." << std::endl;
+        return false;
+    }
+    std::string auth_status(auth_status_bytes.begin(), auth_status_bytes.end());
+
+    if (auth_status != "AUTH_SUCCESS")
+    {
+        std::cerr << "[Client] Authentication failed. Server response: " << auth_status << std::endl;
+        return false;
+    }
+
+    std::cout << "[Client] Authentication successful." << std::endl;
+    return true;
+}
+
+/**
  * @brief Handles the --register command to exchange SSH keys with the bastion-auth server.
  */
 void handle_registration(const char *hostname)
 {
     std::cout << "[Client] Starting registration with " << hostname << " on port " << AUTH_PORT << "..." << std::endl;
+
+    // Connect to the bastion-auth server
+    int sock = connect_to_server(hostname, AUTH_PORT);
+    if (sock < 0)
+        return;
+
+    // HANDSHAKE: Perform handshake to establish a secure channel
+    EVP_PKEY *server_static_key = nullptr;
+    unsigned char *session_key = perform_client_handshake(sock, hostname, server_static_key);
+    if (!session_key)
+    {
+        std::cerr << "[Client] Failed to perform secure handshake with auth server." << std::endl;
+        close(sock);
+        EVP_PKEY_free(server_static_key);
+        return;
+    }
+    EVP_PKEY_free(server_static_key);
+
+    // Perform password authentication
+    if (!perform_password_authentication(sock, session_key))
+    {
+        close(sock);
+        delete[] session_key;
+        return;
+    }
 
     // GENERATE KEY:
 
@@ -104,22 +178,6 @@ void handle_registration(const char *hostname)
         return;
     }
     std::string pub_key_str((std::istreambuf_iterator<char>(pub_key_file)), std::istreambuf_iterator<char>());
-    // Connect to the bastion-auth server
-    int sock = connect_to_server(hostname, AUTH_PORT);
-    if (sock < 0)
-        return;
-
-    // HANDSHAKE: Perform handshake to establish a secure channel
-    EVP_PKEY *server_static_key = nullptr;
-    unsigned char *session_key = perform_client_handshake(sock, hostname, server_static_key);
-    if (!session_key)
-    {
-        std::cerr << "[Client] Failed to perform secure handshake with auth server." << std::endl;
-        close(sock);
-        EVP_PKEY_free(server_static_key);
-        return;
-    }
-    EVP_PKEY_free(server_static_key);
 
     // ACTION A: Send the public key over the encrypted channel
     std::vector<unsigned char> pub_key_bytes(pub_key_str.begin(), pub_key_str.end());
@@ -194,56 +252,14 @@ void start_proxy_session(const char *hostname, const char *target)
     }
     EVP_PKEY_free(server_static_key);
 
-    // PASSWORD AUTHENTICATION
-    // --- NEW: AUTHENTICATION STAGE ---
-    // 1. Get username and password from user
-    std::string username;
-    std::cout << "Username: ";
-    std::getline(std::cin, username);
-    std::string password = get_password_from_stdin(); // Securely get password
-
-
-
-    // 2. Send username
-    std::vector<unsigned char> username_bytes(username.begin(), username.end());
-    if (!send_encrypted_message(sock, username_bytes, session_key))
+    // Perform password authentication
+    if (!perform_password_authentication(sock, session_key))
     {
-        std::cerr << "[Client] Failed to send username." << std::endl;
         close(sock);
         delete[] session_key;
         return;
     }
 
-    // 3. Send password
-    std::vector<unsigned char> password_bytes(password.begin(), password.end());
-    if (!send_encrypted_message(sock, password_bytes, session_key))
-    {
-        std::cerr << "[Client] Failed to send password." << std::endl;
-        close(sock);
-        delete[] session_key;
-        return;
-    }
-
-    // 4. Receive and check authorization status
-    std::vector<unsigned char> auth_status_bytes = receive_encrypted_message(sock, session_key);
-    if (auth_status_bytes.empty())
-    {
-        std::cerr << "[Client] Did not receive authorization status from server." << std::endl;
-        close(sock);
-        delete[] session_key;
-        return;
-    }
-    std::string auth_status(auth_status_bytes.begin(), auth_status_bytes.end());
-
-    if (auth_status != "AUTH_SUCCESS")
-    {
-        std::cerr << "[Client] Authentication failed. Server response: " << auth_status << std::endl;
-        close(sock);
-        delete[] session_key;
-        return;
-    }
-    std::cout << "[Client] Authentication successful." << std::endl;
-    // --- END OF AUTHENTICATION STAGE ---
     // Send the encrypted target destination
     std::string target_str(target);
     std::vector<unsigned char> target_bytes(target_str.begin(), target_str.end());
