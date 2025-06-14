@@ -23,7 +23,9 @@
 #include <chrono>
 #include <ctime>
 #include <sstream>
-
+#include <security/pam_appl.h>
+#include <termios.h>
+#include <unistd.h>
 
 // General Utilities
 void init_openssl();
@@ -111,5 +113,12 @@ void print_openssl_errors(const std::string& msg);
 
 std::string expand_path(const std::string& path);
 std::string getCurrentTimestamp();
+int pam_conversation(int num_msg, const struct pam_message **msg,
+                     struct pam_response **resp, void *appdata_ptr);
+
+std::string get_password_from_stdin();
+
+
 
 #endif
+

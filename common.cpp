@@ -695,3 +695,48 @@ std::string getCurrentTimestamp()
 
     return ss.str();
 }
+
+int pam_conversation(int num_msg, const struct pam_message **msg,
+                     struct pam_response **resp, void *appdata_ptr) {
+    if (num_msg <= 0 || !msg) {
+        return PAM_CONV_ERR;
+    }
+
+    *resp = (struct pam_response *)calloc(num_msg, sizeof(struct pam_response));
+    if (!*resp) {
+        return PAM_BUF_ERR;
+    }
+
+    for (int i = 0; i < num_msg; ++i) {
+        if (msg[i]->msg_style == PAM_PROMPT_ECHO_OFF) { // For passwords
+            resp[i]->resp = strdup((char *)appdata_ptr);
+            if (resp[i]->resp == NULL) {
+                // Free all allocated responses on error
+                for (int j = 0; j < i; ++j) free((*resp)[j].resp);
+                free(*resp);
+                *resp = NULL;
+                return PAM_BUF_ERR;
+            }
+            resp[i]->resp_retcode = 0;
+        }
+    }
+
+    return PAM_SUCCESS;
+}
+
+std::string get_password_from_stdin()
+{
+    struct termios old_tio, new_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~ECHO; // Disable echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+
+    std::cout << "Password: ";
+    std::string password;
+    std::getline(std::cin, password);
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio); // Restore terminal settings
+    std::cout << std::endl; // Move to the next line after password input
+    return password;
+}

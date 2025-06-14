@@ -1,0 +1,75 @@
+// --- Client Authorization (Now with Password Auth) ---
+        bool is_authorized = false;
+        // Receive username
+        std::vector<unsigned char> encrypted_username_bytes = receive_encrypted_message(client_sock, session_key);
+        if (encrypted_username_bytes.empty())
+        {
+            std::cerr << "[Server SRV] Failed to receive username from " << get_server_address_string(&client_addr) << "." << std::endl;
+        }
+        else
+        {
+            std::string username(encrypted_username_bytes.begin(), encrypted_username_bytes.end());
+
+            // Receive password
+            std::vector<unsigned char> encrypted_password_bytes = receive_encrypted_message(client_sock, session_key);
+            if (encrypted_password_bytes.empty())
+            {
+                std::cerr << "[Server SRV] Failed to receive password from " << get_server_address_string(&client_addr) << "." << std::endl;
+            }
+            else
+            {
+                std::string password(encrypted_password_bytes.begin(), encrypted_password_bytes.end());
+
+                // --- PAM Authentication ---
+                pam_handle_t *pamh = NULL;
+                const char *pam_service_name = "sshd"; // Use the 'sshd' service for robust configuration
+                struct pam_conv conv = {pam_conversation, (void *)password.c_str()};
+
+                int retval = pam_start(pam_service_name, username.c_str(), &conv, &pamh);
+
+                if (retval == PAM_SUCCESS)
+                {
+                    retval = pam_authenticate(pamh, 0); // Authenticate the user
+                }
+
+                if (retval == PAM_SUCCESS)
+                {
+                    retval = pam_acct_mgmt(pamh, 0); // Check if account is valid
+                }
+
+                if (retval == PAM_SUCCESS)
+                {
+                    std::cout << "[Server SRV] PAM authentication successful for user '" << username << "' from " << get_server_address_string(&client_addr) << "." << std::endl;
+                    is_authorized = true;
+                }
+                else
+                {
+                    std::cerr << "[Server SRV] PAM authentication failed for user '" << username << "': " << pam_strerror(pamh, retval) << std::endl;
+                }
+
+                if (pamh)
+                {
+                    pam_end(pamh, retval);
+                }
+            }
+        }
+
+        // Send authorization status to client
+        const char *auth_status_msg = is_authorized ? "AUTH_SUCCESS" : "AUTH_FAILURE";
+        std::vector<unsigned char> auth_status_bytes(auth_status_msg, auth_status_msg + strlen(auth_status_msg));
+        if (!send_encrypted_message(client_sock, auth_status_bytes, session_key))
+        {
+            std::cerr << "[Server SRV] Failed to send auth status to client." << std::endl;
+            is_authorized = false; // Prevent proceeding if we can't communicate status
+        }
+
+        if (!is_authorized)
+        {
+            std::cerr << "[Server SRV] Authorization failed. Closing connection for " << get_server_address_string(&client_addr) << "." << std::endl;
+            close(client_sock);
+            delete[] session_key;
+            EVP_PKEY_free(p_client_ephemeral_pubkey);
+            return;
+        }
+
+// -- END CLIENT AUTHENTICATION
