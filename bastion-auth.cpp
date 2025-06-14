@@ -10,8 +10,8 @@
 #include <sys/wait.h>
 #include <thread>
 #include <vector>
-#include <pty.h> 
-#include <sys/stat.h> 
+#include <pty.h> // Include for forkpty
+#include <sys/stat.h> // Include for mkdir and stat
 #include <fstream>
 #include <sstream>
 #include <openssl/ec.h>
@@ -22,9 +22,10 @@
 
 #define PORT 2023
 const std::string SERVER_STATIC_KEY_FILE = "server_static_key.pem";
+const std::string SERVER_KEY_PATH = "~/.ssh/id_rsa_bastion_auth";
 
 EVP_PKEY* server_static_key = NULL;
-
+// unsigned char session_key[AES_KEY_SIZE];
 
 volatile sig_atomic_t running = 1;
 
@@ -39,11 +40,34 @@ std::vector<unsigned char> string_to_vector(const std::string& str) {
 void handle_client(int client_sock, sockaddr_in client_addr) {
     print_openssl_errors("Start handle_client");
 
+    // GENERATE KEY:
+
+    // Replace absolute paths with expanded path
+    std::string key_path = expand_path(SERVER_KEY_PATH);
+    std::string pub_key_path = key_path + ".pub";
+
+    // Check if the key exists, otherwise generate it
+    struct stat buffer;
+    if (stat(key_path.c_str(), &buffer) != 0) {
+        std::cout << "[Client] SSH key not found. Generating a new one at " << key_path << std::endl;
+        std::string command = "ssh-keygen -t rsa -b 4096 -f " + key_path + " -N '' -C 'bastion-client-server'";
+        if (system(command.c_str()) != 0) {
+            std::cerr << "[Client] Failed to generate SSH key. Please ensure ssh-keygen is installed." << std::endl;
+            return;
+        }
+    }
+
+    // Read the server's public key from the file
+    std::ifstream pub_key_file(pub_key_path);
+    if (!pub_key_file) {
+        std::cerr << "[Client] Could not read public key file: " << pub_key_path << std::endl;
+        return;
+    }
+    std::string pub_key_str((std::istreambuf_iterator<char>(pub_key_file)), std::istreambuf_iterator<char>());
+
+    // HANDSHAKE: Perform handshake to establish a secure channel
     EVP_PKEY* client_ephemeral_pubkey = NULL;
-    
-    unsigned char* session_key = perform_server_handshake(client_sock, &client_addr, 
-                                                        server_static_key, client_ephemeral_pubkey);
-    
+    unsigned char* session_key = perform_server_handshake(client_sock, &client_addr, server_static_key, client_ephemeral_pubkey);
     if (!session_key) {
         std::cerr << "[Server] Handshake failed for client." << std::endl;
         close(client_sock);
@@ -54,94 +78,46 @@ void handle_client(int client_sock, sockaddr_in client_addr) {
 
     EVP_PKEY_free(client_ephemeral_pubkey);
 
-
-    
-
-    
-
-    
-    const char* home = getenv("HOME");
-    if (!home) {
-        std::cerr << "[Server] Could not get HOME directory" << std::endl;
-        return;
-    }
-    std::string ssh_dir = std::string(home) + "/.ssh";
-    std::string auth_keys_path = ssh_dir + "/authorized_keys";
-
-    
-    struct stat st;
-    if (stat(ssh_dir.c_str(), &st) == -1) {
-        if (mkdir(ssh_dir.c_str(), 0700) == -1) {
-            std::string error_msg = "Failed to create .ssh directory: " + std::string(strerror(errno));
-            std::vector<unsigned char> error_vec(error_msg.begin(), error_msg.end());
-            send_encrypted_message(client_sock, error_vec, session_key);
-            close(client_sock);
-            delete[] session_key;
-            return;
-        }
-    }
-
-    
+    // ACTION A: Receive client's public key
     std::vector<unsigned char> client_pubkey_bytes = receive_encrypted_message(client_sock, session_key);
     if (client_pubkey_bytes.empty()) {
-        std::cerr << "[Server] Failed to receive client's public key" << std::endl;
-        close(client_sock);
-        delete[] session_key;
-        return;
-    }
-    std::string client_pubkey(client_pubkey_bytes.begin(), client_pubkey_bytes.end());
+        std::cerr << "[Server] Failed to receive bastion's public key." << std::endl;
+    } else {
+        std::cout << "[Server] Received bastion's public key." << std::endl;
+        std::string bastion_pubkey(client_pubkey_bytes.begin(), client_pubkey_bytes.end());
 
-    
-    
-    std::ofstream auth_keys(auth_keys_path, std::ios::app);
-    if (!auth_keys.is_open()) {
-        std::string error_msg = "Failed to open authorized_keys: " + std::string(strerror(errno));
-        std::vector<unsigned char> error_vec(error_msg.begin(), error_msg.end());
-        send_encrypted_message(client_sock, error_vec, session_key);
-        close(client_sock);
-        delete[] session_key;
-        return;
-    }
-    auth_keys << client_pubkey << "\n";
-    auth_keys.close();
-    chmod(auth_keys_path.c_str(), 0600);
+        // Add the bastion's key to authorized_keys file
+        std::string ssh_dir = expand_path("~/.ssh");
+        std::string auth_keys_path = ssh_dir + "/bastion_authorized_keys";
 
-    
-    if (stat("/etc/ssh/ssh_host_rsa_key", &st) == -1 || 
-        stat("/etc/ssh/ssh_host_ed25519_key", &st) == -1) {
-        if (system("ssh-keygen -A") != 0) {
-            std::string error_msg = "Failed to generate host keys";
-            std::vector<unsigned char> error_vec(error_msg.begin(), error_msg.end());
-            send_encrypted_message(client_sock, error_vec, session_key);
-            close(client_sock);
-            delete[] session_key;
-            return;
+        // Open authorized_keys file in append mode
+        std::ofstream auth_keys(auth_keys_path, std::ios::app);
+        if (!auth_keys.is_open())
+        {
+            std::cerr << "[Server] Failed to open authorized_keys: " << strerror(errno) << std::endl;
         }
+        else
+        {
+            auth_keys << bastion_pubkey;
+            if (bastion_pubkey.back() != '\n')
+                auth_keys << "\n";
+            std::cout << "[Server] Bastion's public key added to " << auth_keys_path << std::endl;
+        }
+
+        auth_keys.close();
+        chmod(auth_keys_path.c_str(), 0600); // Set proper permissions for the keys file
+        chmod(ssh_dir.c_str(), 0700);        // Set proper permissions for the .ssh directory
     }
 
-    
-    std::ifstream server_key_file("/etc/ssh/ssh_host_rsa_key.pub");
-    if (!server_key_file.is_open()) {
-        std::string error_msg = "Failed to read server public key";
-        std::vector<unsigned char> error_vec(error_msg.begin(), error_msg.end());
-        send_encrypted_message(client_sock, error_vec, session_key);
-        close(client_sock);
-        delete[] session_key;
-        return;
+    // ACTION B: Send the server's public key to the client
+    std::vector<unsigned char> pub_key_bytes(pub_key_str.begin(), pub_key_str.end());
+    if (!send_encrypted_message(client_sock, pub_key_bytes, session_key)) {
+        std::cerr << "[Client] Failed to send public key to auth server." << std::endl;
+    } else {
+        std::cout << "[Client] Successfully sent public key to the bastion." << std::endl;
     }
 
-    std::stringstream buffer;
-    buffer << server_key_file.rdbuf();
-    std::string server_pubkey = buffer.str();
-    server_key_file.close();
-
-    if (!send_encrypted_message(client_sock, string_to_vector(server_pubkey), session_key)) {
-        std::cerr << "[Server] Failed to send server public key" << std::endl;
-        close(client_sock);
-        delete[] session_key;
-        return;
-    }
-
+    // Send a success message to the logs
     std::string success_msg = "Key exchange completed";
     std::vector<unsigned char> success_vec(success_msg.begin(), success_msg.end());
     if (!send_encrypted_message(client_sock, success_vec, session_key)) {
@@ -165,7 +141,7 @@ int main() {
     if (!server_static_key) {
         std::cerr << "[Server] Static key not found. Generating new key pair..." << std::endl;
         
-        
+        // Generate ECDSA key with explicit parameters
         server_static_key = EVP_PKEY_new();
         if (!server_static_key) {
             error_exit("[Server] Failed to create EVP_PKEY structure");
@@ -189,7 +165,7 @@ int main() {
             error_exit("[Server] Failed to assign EC key to EVP_PKEY");
         }
 
-        
+        // Save the key in PEM format
         FILE* f = fopen(SERVER_STATIC_KEY_FILE.c_str(), "wb");
         if (!f) {
             EVP_PKEY_free(server_static_key);
@@ -226,7 +202,7 @@ int main() {
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
         error_exit("[Server SRV Error] Bind failed");
 
-    if (listen(sockfd, 10) < 0) 
+    if (listen(sockfd, 10) < 0) // Increased backlog slightly
         error_exit("[Server SRV Error] Listen failed");
 
     std::cout << "[Server SRV] SSH proxy server listening securely on port " << PORT << std::endl;
@@ -234,15 +210,15 @@ int main() {
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
-        
+        // The TODO for checking client key/fingerprint was here, but it's better done inside handle_client.
         int client_sock = accept(sockfd, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
-            perror("[Server SRV Error] Accept failed"); 
+            perror("[Server SRV Error] Accept failed"); // Log error but continue server operation
             continue;
         }
         std::cout << "[Server SRV] Connection accepted from " << get_server_address_string(&client_addr) << std::endl;
 
-        
+        // Detach thread to handle client connection concurrently
         std::thread(handle_client, client_sock, client_addr).detach();
     }
 

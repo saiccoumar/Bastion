@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <map>
+#include <wordexp.h>
 
 
 
@@ -105,5 +106,7 @@ std::string get_server_address_string(const sockaddr_in* addr);
 
 void error_exit(const std::string& msg);
 void print_openssl_errors(const std::string& msg);
+
+std::string expand_path(const std::string& path);
 
 #endif

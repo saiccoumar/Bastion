@@ -667,3 +667,13 @@ void print_openssl_errors(const std::string& msg) {
     ERR_print_errors_fp(stderr);
     ERR_clear_error(); 
 }
+
+std::string expand_path(const std::string& path) {
+    wordexp_t p;
+    if (wordexp(path.c_str(), &p, 0) != 0) {
+        return "";
+    }
+    std::string expanded_path = p.we_wordv[0];
+    wordfree(&p);
+    return expanded_path;
+}
